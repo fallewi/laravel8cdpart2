@@ -1,10 +1,6 @@
 pipeline {
     agent any
-    environment {
-        AWS_ACCESS_KEY_ID = credentials("aws-access-key-id")
-        AWS_SECRET_ACCESS_KEY = credentials("aws-secret-access-key")
-        AWS_SESSION_TOKEN = credentials("aws-session-token")
-    }
+   
     stages {
         stage("Build") {
             environment {
@@ -65,9 +61,7 @@ pipeline {
         }
         stage("Deploy to staging") {
             steps {
-                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
-                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+             
                 sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-staging-run.yml'"
             }
         }
@@ -79,34 +73,23 @@ pipeline {
         }
         stage("Acceptance test codeception") {
             steps {
-                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
-                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+              
                 sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-staging-acceptance.yml'"
             }
             post {
                 always {
-                    sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-                    sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
-                    sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
                     sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-staging-stop.yml'"
                 }
             }
         }
         stage("Release") {
             steps {
-                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
-                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
                 sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-production-run.yml'"
             }
         }
         stage("Smoke test") {
             steps {
                 sleep 20
-                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
-                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
                 sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-production-acceptance.yml'"
             }
         }
