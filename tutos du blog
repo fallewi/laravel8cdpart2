@@ -1,0 +1,415 @@
+Configure Laravel 8 for CI/CD with Jenkins and GitHub — Part 2
+Daniel Correa
+Daniel Correa
+Follow
+Oct 3 · 11 min read
+
+
+
+
+
+This is the second part of the “Configure Laravel 8 for CI/CD with Jenkins and GitHub” story.
+In the first part, I discussed some lessons I learnt from the “Continuous Delivery with Docker and Jenkins — Second edition” book (Chapters 1 to 5). It was about applying unit tests, code coverage tests, and acceptance tests for a Laravel 8 project (CI/CD). In that case, we used Amazon AWS, Jenkins, GitHub and Docker. Part 1 can be found here: https://medium.com/@danielgara/configure-laravel-8-for-ci-cd-with-jenkins-and-github-part-1-58b9be304292
+In the second part, I’m going to introduce how to finish the CI/CD process (based on some elements I took from Chapters 6 to 8 of the Continuous Delivery book). In this case, we will make some modifications to the code presented in part 1, and we will design and implement a complete pipeline, which will allow us to release the new Laravel project versions in a production environment. The complete process can be found in Figure 1.
+Image for post
+Figure 1. Complete CI/CD process
+0. New concepts introduction
+Ansible is the simplest way to automate apps and IT infrastructure. Application Deployment + Configuration Management + Continuous Delivery.
+Smoke tests are a subset of test cases that cover the most important functionality of a component or system, used to aid assessment of whether main functions of the software appear to work correctly. It determines whether the deployed build is stable or not.
+Creating AWS EC2 required instances
+As seen in Figure 1 we will need 3 different instances.
+VM-Jenkins: it will be the main instance, here we will install Docker, and we will deploy a Jenkins container which internally will include: Docker (Docker inside Docker), PHP, and Ansible.
+I created that instance based on the next characteristics:
+Image: Amazon Linux AMI 2018
+Instance: t2.micro
+Security groups: I opened HTTP, HTTPS ports. And I opened TCP 50000, and TCP 49001.
+VM-Staging: it will represent the staging environment. We will use it to deploy the new project versions and apply there some acceptance tests. For this instance, I added a new tag (through the AWS EC2 panel) with the next content (key: “type”, value: “staging”).
+VM-Production: it will represent the production environment. We will use it to deploy the new project versions and apply there some smoke tests. For this instance, I added a new tag (through the AWS EC2 panel) with the next content (key: “type”, value: “production”).
+I created the previous two instances based on the next characteristics:
+Image: Amazon Linux 2 AMI
+Instance: t2.micro
+Security groups: I opened HTTP, HTTPS ports.
+Image for post
+Figure 2. AWS EC2 available instances
+Configuring Jenkins instance
+I installed Docker in that instance:
+sudo yum update -y
+sudo yum install -y docker
+sudo service docker start
+sudo usermod -a -G docker ec2-user
+I created the same Dockerfile that I used in the story part 1.
+FROM jenkins/jenkins:2.257-centos7
+USER root
+RUN yum install epel-release -y
+RUN rpm -Uvh http://rpms.famillecollet.com/enterprise/remi-release-7.rpm
+RUN yum — enablerepo=remi-php74 install php php-mbstring php-xml php-pdo php-pdo_mysql php-xdebug -y
+RUN yum update -y 
+RUN cd /tmp
+RUN curl -sS https://getcomposer.org/installer | php
+RUN mv composer.phar /usr/local/bin/composer
+Then I created a docker image (I called it jenkins-php), and I run a docker container:
+docker image build -t jenkins-php .docker run -d -p 49001:8080 -p 50000:50000 \
+ -v /var/run/docker.sock:/var/run/docker.sock \
+ — name jenkins jenkins-php
+The difference with the Jenkins container (regarding story part 1), it was that in this case, I will need to install Docker inside Docker, but also Ansible. Ansible will be used to connect and execute some commands inside the staging and production instances. In order to that, I executed the next commands:
+docker exec -it -u root jenkins bash
+yum install -y yum-utils
+yum-config-manager \
+ — add-repo \
+ https://download.docker.com/linux/centos/docker-ce.repo
+yum install -y docker-ce docker-ce-cli containerd.io
+docker — version
+chmod 666 /var/run/docker.sock
+yum install ansible -y
+ansible --version
+yum install -y nano
+I installed Docker, but I also installed Ansible. I applied the next configuration over Ansible.
+cd /etc/ansible/
+nano ansible.cfg
+I included the next 3 lines after the [defaults] line
+inventory = ./ansible_plugins
+enable_plugins = aws_ec2
+host_key_checking = False
+Then, I create a new folder and I create a yml file that represents the Ansible dynamic inventory (the next code allows me to collect my EC2 instances information dynamically). More info here: https://aws.amazon.com/es/blogs/apn/getting-started-with-ansible-and-dynamic-amazon-ec2-inventory-management/
+mkdir ansible_plugins
+cd ansible_plugins
+nano production_aws_ec2.yml
+I put the next content in the previous file (I changed the “aws_access_key” and “aws_secret_key” for my respective keys):
+# aws ec2 ansible dynamic inventory plugin
+plugin: aws_ec2
+#set aws_access_key and secret_key.
+aws_access_key: AWS_ACCESS_KEY
+aws_secret_key: AWS_SECRET_KEY
+# set the regions. 
+regions: 
+  - us-east-1
+# - us-east-2
+# set strict to False    
+# if True this will make invalid entries 
+# a fatal error
+strict: False
+keyed_groups:
+  #  each aws ec2 instance has it own instance tags. create  
+  #  a tag variable from those tags for ansible to use. 
+  #  if the ec2 tag Name had the value cygnusx1 the tag 
+  #  variable would be: 
+  #  tag_Name_cygnusx1
+  #  if a tag existed for an aws instance as  
+  #  Applications with the value of Oracle the  
+  #  variable would be:
+  #  tag_Applications_Oracle
+  - key: tags
+    prefix: tag
+  #
+  # the following keyed groups are from the aws url:
+  # https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-instances.html#options   
+  # below are some of the variable that can be used.  
+  # an example for instance_type: 
+  # aws_instance_type_t2_micro
+  - key: architecture
+    prefix: arch
+  - key: tags.Applications
+    separator: ''
+  - key: instance_type
+    prefix: aws_instance_type
+  - key: placement.region
+    prefix: aws_region
+  - key: image_id
+    prefix: aws_image
+  - key: hypervisor
+    prefix: aws_hypervisor
+  - key: 'security_groups|json_query("[].group_id")'
+    prefix: 'security_groups'
+hostnames:
+# a list in order of precedence for hostname variables.
+# 
+  - ip-address
+  - dns-name
+  - tag:Name
+  - private-ip-address
+compose:
+# use if you need to connect via the ec2
+# private ip address. 
+#
+# this is needed for example in a 
+# corporate / company environment where ec2 
+# instances don't use a public ip address
+#
+#  ansible_host: private_ip_address
+I also installed two libraries required by Ansible, and I create a new file to store my pem key. This file will be used later in the Jenkins pipeline (to allow us to connect the Jenkins instance with the staging and production instances).
+yum -y install python-pip
+pip install boto3
+cd /etc/ansible
+mkdir pem
+nano pem/key.pem
+Inside the previous file, I put my key.pem content (that I normally use to connect to my instances through SSH). Something like this:
+-----BEGIN RSA PRIVATE KEY-----
+MIIE…
+-----END RSA PRIVATE KEY-----
+2. Creating the Ansible playbooks
+Working with the staging and production environments requires communication between the Jenkins container and the previous environments. For example: (i) to deploy the new version in the staging environment (in order to apply the acceptance tests), or (ii) to deploy the release product in the production environment.
+To be able to perform the previous processes I created 4 Ansible playbooks.
+playbook-staging-run.yml
+This playbook allows to install the required software inside the staging environment, and at the end, runs a new version of the laravel project (runs a new container).
+cd /etc/ansible/
+mkdir playbook
+nano /etc/ansible/playbook/playbook-staging-run.yml
+I put the next content (check it runs a new danielgara/laravel8cdpart2 container in the port 80 — only over the instance with tag type: “staging”):
+- hosts: tag_type_staging
+  become: yes
+  remote_user: ec2-user
+  name: Upgrade all packages
+  tasks: 
+    - name: Update all
+      yum: name=* state=latest
+    - name: install docker
+      yum: name=docker state=latest
+    - name: Start docker service
+      systemd:
+        state: started
+        name: docker
+    - name: Add admin user
+      user:
+        name: admin
+        groups: docker
+        append: yes
+    - name: install python-pip
+      yum: name=python-pip state=present
+    - name: install docker-py
+      pip: name=docker-py
+    - name: Run laravel container
+      docker_container: 
+        name: laravel8cdpart2 
+        image: danielgara/laravel8cdpart2 
+        state: started 
+        exposed_ports: "80"
+        published_ports: "80:80"
+playbook-staging-acceptance.yml
+This playbook allows to execute the acceptance test over the running container in the staging environment.
+nano /etc/ansible/playbook/playbook-staging-acceptance.yml
+I put the next content (check it executes the co-deception acceptance test s— only over the instance with tag type: “staging”):
+- hosts: tag_type_staging
+  become: yes
+  remote_user: ec2-user
+  tasks: 
+    - name: Run acceptance tests
+      command: docker exec -it laravel8cdpart2 bash -c 'vendor/bin/codecept run';
+      register: atesting
+    - debug: msg="{{ atesting.stdout }}"
+playbook-staging-stop.yml
+This playbook allows to stop the container and remove the docker image.
+nano /etc/ansible/playbook/playbook-staging-stop.yml
+I put the next content:
+- hosts: tag_type_staging
+  become: yes
+  remote_user: ec2-user
+  tasks: 
+    - name: Delete laravel containers
+      docker_container:
+        name: laravel8cdpart2
+        force_kill: true
+        keep_volumes: false
+        state: absent
+     - name: Remove image
+      docker_image:
+        state: absent
+        name: danielgara/laravel8cdpart2
+playbook-production-run.yml
+This playbook allows to install the required software inside the production environment, and at the end, runs a new version of the laravel project (runs a new container).
+nano /etc/ansible/playbook/playbook-production-run.yml
+I put the next content (check it runs a new danielgara/laravel8cdpart2 container in the port 80 — only over the instance with tag type: “production”):
+- hosts: tag_type_production
+  become: yes
+  remote_user: ec2-user
+  name: Upgrade all packages
+  tasks: 
+    - name: Update all
+      yum: name=* state=latest
+    - name: install docker
+      yum: name=docker state=latest
+    - name: Start docker service
+      systemd:
+        state: started
+        name: docker
+    - name: Add admin user
+      user:
+        name: admin
+        groups: docker
+        append: yes
+    - name: install python-pip
+      yum: name=python-pip state=present
+    - name: install docker-py
+      pip: name=docker-py
+    - name: Delete laravel containers
+      docker_container:
+        name: laravel8cdpart2
+        force_kill: true
+        keep_volumes: false
+        state: absent
+    - name: Remove image
+      docker_image:
+        state: absent
+        name: danielgara/laravel8cdpart2
+    - name: Run laravel container
+      docker_container: 
+        name: laravel8cdpart2 
+        image: danielgara/laravel8cdpart2 
+        state: started 
+        exposed_ports: "80"
+        published_ports: "80:80"
+playbook-production-acceptance.yml
+This playbook allows to execute the smoke tests over the running container in the production environment.
+nano /etc/ansible/playbook/playbook-production-acceptance.yml
+I put the next content (check it executes the codeception acceptance test s — only over the instance with tag type: “production”):
+- hosts: tag_type_production
+  become: yes
+  remote_user: ec2-user
+  tasks: 
+    - name: Run smoke tests
+      command: docker exec -it laravel8cdpart2 bash -c 'vendor/bin/codecept run';
+      register: stesting
+    - debug: msg="{{ stesting.stdout }}"
+In this case acceptance tests and smoke tests are the same. However, commonly, smoke tests are a subset of acceptance tests.
+3. Complete pipeline
+I developed a new GitHub project about this story. That GitHub project can be found here: https://github.com/danielgara/laravel8cdpart2
+The last part was to update the jenkins file, to be consistent with the new environments and the new tasks. The complete jenkins file is presented next:
+pipeline {
+    agent any
+    environment {
+        AWS_ACCESS_KEY_ID = credentials("aws-access-key-id")
+        AWS_SECRET_ACCESS_KEY = credentials("aws-secret-access-key")
+        AWS_SESSION_TOKEN = credentials("aws-session-token")
+    }
+    stages {
+        stage("Build") {
+            environment {
+                DB_HOST = credentials("laravel-host")
+                DB_DATABASE = credentials("laravel-database")
+                DB_USERNAME = credentials("laravel-user")
+                DB_PASSWORD = credentials("laravel-password")
+            }
+            steps {
+                sh 'php --version'
+                sh 'composer install'
+                sh 'composer --version'
+                sh 'cp .env.example .env'
+                sh 'echo DB_HOST=${DB_HOST} >> .env'
+                sh 'echo DB_USERNAME=${DB_USERNAME} >> .env'
+                sh 'echo DB_DATABASE=${DB_DATABASE} >> .env'
+                sh 'echo DB_PASSWORD=${DB_PASSWORD} >> .env'
+                sh 'php artisan key:generate'
+                sh 'cp .env .env.testing'
+                sh 'php artisan migrate'
+            }
+        }
+        stage("Unit test") {
+            steps {
+                sh 'php artisan test'
+            }
+        }
+        stage("Code coverage") {
+            steps {
+                sh "vendor/bin/phpunit --coverage-html 'reports/coverage'"
+            }
+        }
+        stage("Static code analysis larastan") {
+            steps {
+                sh "vendor/bin/phpstan analyse --memory-limit=2G"
+            }
+        }
+        stage("Static code analysis phpcs") {
+            steps {
+                sh "vendor/bin/phpcs"
+            }
+        }
+        stage("Docker build") {
+            steps {
+                sh "docker rmi danielgara/laravel8cdpart2"
+                sh "docker build -t danielgara/laravel8cdpart2 --no-cache ."
+            }
+        }
+        stage("Docker push") {
+            environment {
+                DOCKER_USERNAME = credentials("docker-user")
+                DOCKER_PASSWORD = credentials("docker-password")
+            }
+            steps {
+                sh "docker login --username ${DOCKER_USERNAME} --password ${DOCKER_PASSWORD}"
+                sh "docker push danielgara/laravel8cdpart2"
+            }
+        }
+        stage("Deploy to staging") {
+            steps {
+                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+                sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-staging-run.yml'"
+            }
+        }
+        stage("Acceptance test curl") {
+            steps {
+                sleep 20
+                sh "chmod +x acceptance_test.sh && ./acceptance_test.sh"
+            }
+        }
+        stage("Acceptance test codeception") {
+            steps {
+                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+                sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-staging-acceptance.yml'"
+            }
+            post {
+                always {
+                    sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+                    sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+                    sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+                    sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-staging-stop.yml'"
+                }
+            }
+        }
+        stage("Release") {
+            steps {
+                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+                sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-production-run.yml'"
+            }
+        }
+        stage("Smoke test") {
+            steps {
+                sleep 20
+                sh "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+                sh "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+                sh "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+                sh "ssh-agent sh -c 'ssh-add /etc/ansible/pem/key.pem && ansible-playbook /etc/ansible/playbook/playbook-production-acceptance.yml'"
+            }
+        }
+    }
+}
+There are some differences between this pipeline and the pipeline presented in the part 1.
+AWS credentials were added (in order to connect with the other instances).
+“Deploying to staging”: now it doesn’t deploy the new project version inside the jenkins container. Now, it deploys the new project version inside the staging environment.
+“Acceptance test curl” and “Acceptance test codeception”: now they run the tests over the container inside the staging environment.
+“Release”: it deploys the new project version inside the production environment.
+“Smoke test”: it runs the smoke tests over the container inside the production environment.
+4. Jenkins item
+I create a new jenkins item (called “laravelpart2”), I connected it to my repo: https://github.com/danielgara/laravel8cdpart2 and I build a new job. Figure 3 shows the results.
+Image for post
+Figure 3. laravelpart2 job completed
+After the job was completed. I checked my instance DNS and I saw the project loading properly (see Figure 4). It means that the complete CI/CD process (presented in Figure 1) worked as expected).
+Image for post
+Figure 4. Project running in the production environment.
+I also applied a change in the laravel project. I modified the main page text, from “Home” to “Home — V2”. Then, a new job was automatically started (thanks to the jenkins GitHub integration plugin) and 4 minutes later I reloaded the production instance URL, and the next project version loaded properly (check Figure 5).
+Image for post
+Figure 5. Project running in the production environment (after a minor change).
+5. Important notes
+Remember that this example is very basic and there are important things to consider:
+Scaling: you should apply Docker Swarm, or Kubernetes if you want to scale your applications. This example only shows 3 VMs with no scaling at all.
+Deployment rollbacks: there must be a system to rollback to a previous version in case of failures.
+Versioning: you should include a versioning system to manage your images. I didn’t apply it in this basic example. But you can find more information on internet or in the book I recommend.
+Other tests: you should include other types of tests in your pipeline. Such as: securty testing, performance testing, and many more.
+Docker hub security: my docker hub images are public, and they are already connected to my RDS (which was deleted). So remember to put them private, or at least build the images without sensitive information.
+Minor fixes: in the “acceptance_test.sh” file, you should replace my instance DNS. And remember the suggestions I made in the part 1 of this story.
+Summary
+We completed a practical introduction to CI/CD with Jenkins, Docker, Ansible and based on Laravel 8 projects. I hope you enjoyed this story and got some knowledge. If you have any questions or suggestions please leave it in the comment section.
